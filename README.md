@@ -7,6 +7,7 @@
 
 ### List Collection as Virtual Folder
 <img width="1272" height="1696" alt="FileManager_2026-04-08_084330" src="https://github.com/user-attachments/assets/568940a8-20e7-43f6-a113-7e386c79b2bf" />
+
 ## Features 
 -----
 - ### **Browse collections as virtual folders**
