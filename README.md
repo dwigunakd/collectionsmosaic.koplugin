@@ -1,6 +1,12 @@
 # Collections View - Koreader Plugin 
 ## A KOReader plugin that transforms collections into a more visual, folder-like browsing experience. Tested on Kindle Paperwhite 12 Koreader 03.2026
 -----
+## Preview 
+### Collections Root Folder
+<img width="1272" height="1696" alt="FileManager_2026-04-08_084300" src="https://github.com/user-attachments/assets/9d39e3d2-db87-42a8-a647-c7e524db8247" />
+
+### List Collection as Virtual Folder
+<img width="1272" height="1696" alt="FileManager_2026-04-08_084330" src="https://github.com/user-attachments/assets/568940a8-20e7-43f6-a113-7e386c79b2bf" />
 ## Features 
 -----
 - ### **Browse collections as virtual folders**
