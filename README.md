@@ -22,3 +22,6 @@
 1. Download the Zip Below
 2. Extract and copy the zcollectionsview.koplugin folder to your device's plugins/ directory
 3. Restart KOReader and go to **Menu -> Tools -> Collection** View to change the settings
+   
+## Notes
+It doesn’t work with “Project Title” view. The plugin depends on CoverBrowser, so it may conflict with other plugins or patches that modify folder images or the file browser UI. Since it also generates folder covers, conflicts are expected if you're using similar tweaks.
