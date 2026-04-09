@@ -11,6 +11,7 @@ local Geom = require("ui/geometry")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
+local InputContainer = require("ui/widget/container/inputcontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local LineWidget = require("ui/widget/linewidget")
 local logger = require("logger")
@@ -35,7 +36,9 @@ local CollectionsView = WidgetContainer:extend{
 local patched = false
 local SETTINGS_ROOT_LABEL = "zcollectionsview_root_label"
 local SETTINGS_LABEL_POSITION = "zcollectionsview_label_position"
+local SETTINGS_LABEL_FONT_SIZE = "zcollectionsview_label_font_size"
 local SETTINGS_SORT_MODE = "zcollectionsview_sort_mode"
+local SETTINGS_FOLDER_SORT_MODE = "zcollectionsview_folder_sort_mode"
 local SETTINGS_HIDE_UNDERLINE = "zcollectionsview_hide_underline"
 
 local function getHideUnderlineSetting()
@@ -174,26 +177,6 @@ local function installCollectionsViewPlugin()
         }
         pruneImageDimCache()
         return w, h
-    end
-
-    local function trimString(text)
-        if type(text) ~= "string" then
-            return nil
-        end
-        local trimmed = text:gsub("^%s+", ""):gsub("%s+$", "")
-        if trimmed == "" then
-            return nil
-        end
-        return trimmed
-    end
-
-    local function getCollectionsRootLabel()
-        return trimString(G_reader_settings and G_reader_settings:readSetting(SETTINGS_ROOT_LABEL))
-            or _("Collections")
-    end
-
-    local function getCollectionsDisplayText()
-        return COLLECTIONS_SYMBOL .. " " .. getCollectionsRootLabel()
     end
 
     local function escapePattern(str)
@@ -350,10 +333,7 @@ local function installCollectionsViewPlugin()
         local function getAttr(entry, key)
             return (entry and entry.attr and entry.attr[key]) or 0
         end
-        local function compareWithFallback(a, b, primary)
-            if primary == true then return true end
-            if primary == false then return false end
-            -- primary is nil: fall through to tiebreakers
+        local function compareWithFallback(a, b)
             local ao = type(a.order) == "number" and a.order or 0
             local bo = type(b.order) == "number" and b.order or 0
             if ao ~= bo then
@@ -363,7 +343,6 @@ local function installCollectionsViewPlugin()
             if ad ~= bd then
                 return ad < bd
             end
-            -- Final stable tiebreaker: use file path to guarantee strict ordering
             return tostring(a.file or "") < tostring(b.file or "")
         end
 
@@ -371,34 +350,53 @@ local function installCollectionsViewPlugin()
             if sort_mode == "title_desc" then
                 local ad, bd = getDisplay(a), getDisplay(b)
                 if ad ~= bd then return ad > bd end
-                return compareWithFallback(a, b, nil)
+                return compareWithFallback(a, b)
             elseif sort_mode == "title_asc" then
                 local ad, bd = getDisplay(a), getDisplay(b)
                 if ad ~= bd then return ad < bd end
-                return compareWithFallback(a, b, nil)
+                return compareWithFallback(a, b)
             elseif sort_mode == "access_desc" then
                 local aa, ba = getAttr(a, "access"), getAttr(b, "access")
                 if aa ~= ba then return aa > ba end
-                return compareWithFallback(a, b, nil)
+                return compareWithFallback(a, b)
             elseif sort_mode == "access_asc" then
                 local aa, ba = getAttr(a, "access"), getAttr(b, "access")
                 if aa ~= ba then return aa < ba end
-                return compareWithFallback(a, b, nil)
+                return compareWithFallback(a, b)
             elseif sort_mode == "modified_desc" then
-                -- Use entry.order as "date added to collection" (higher order = added later = newer)
                 local ao = type(a.order) == "number" and a.order or 0
                 local bo = type(b.order) == "number" and b.order or 0
                 if ao ~= bo then return ao > bo end
-                return compareWithFallback(a, b, nil)
+                return compareWithFallback(a, b)
             elseif sort_mode == "modified_asc" then
                 local ao = type(a.order) == "number" and a.order or 0
                 local bo = type(b.order) == "number" and b.order or 0
                 if ao ~= bo then return ao < bo end
-                return compareWithFallback(a, b, nil)
+                return compareWithFallback(a, b)
             end
-            return compareWithFallback(a, b, nil)
+            return compareWithFallback(a, b)
         end)
         return ordered
+    end
+
+    local function trimString(text)
+        if type(text) ~= "string" then
+            return nil
+        end
+        local trimmed = text:gsub("^%s+", ""):gsub("%s+$", "")
+        if trimmed == "" then
+            return nil
+        end
+        return trimmed
+    end
+
+    local function getCollectionsRootLabel()
+        return trimString(G_reader_settings and G_reader_settings:readSetting(SETTINGS_ROOT_LABEL))
+            or _("Collections")
+    end
+
+    local function getCollectionsDisplayText()
+        return COLLECTIONS_SYMBOL .. " " .. getCollectionsRootLabel()
     end
 
     local function getCoverOverrides()
@@ -505,8 +503,11 @@ local function installCollectionsViewPlugin()
     end
 
     local function getDirectoryCoverFile(menu, entry)
-        if not entry or entry.is_collections_virtual then
-            return entry and entry.virtual_cover_file or nil
+        if not entry then
+            return nil
+        end
+        if entry.is_collections_virtual then
+            return entry.virtual_cover_file
         end
         if type(entry._zcv_cover_file) == "string" then
             return entry._zcv_cover_file
@@ -582,9 +583,20 @@ local function installCollectionsViewPlugin()
             end
             return nil
         end
+
+        local cover_specs = {
+            max_cover_w = max_w,
+            max_cover_h = max_h,
+        }
         local bookinfo = BookInfoManager:getBookInfo(filepath, true)
-        if not bookinfo or not bookinfo.cover_fetched or not bookinfo.has_cover or bookinfo.ignore_cover or not bookinfo.cover_bb then
+        if not bookinfo or not bookinfo.cover_fetched or not bookinfo.has_cover or bookinfo.ignore_cover then
             if bookinfo and bookinfo.cover_bb then
+                bookinfo.cover_bb:free()
+            end
+            return nil
+        end
+        if BookInfoManager.isCachedCoverInvalid(bookinfo, cover_specs) then
+            if bookinfo.cover_bb then
                 bookinfo.cover_bb:free()
             end
             return nil
@@ -618,6 +630,14 @@ local function installCollectionsViewPlugin()
             or "bottom"
     end
 
+    local function getSimpleUILabelBaseFontSize()
+        local configured = G_reader_settings and G_reader_settings:readSetting(SETTINGS_LABEL_FONT_SIZE)
+        if type(configured) == "number" then
+            return Screen:scaleBySize(configured)
+        end
+        return SIMPLEUI_BASE_DIR_FS
+    end
+
     local function getTwoByThreeSlot(max_w, max_h)
         local slot_w = math.max(8, math.min(max_w, math.floor(max_h * 2 / 3)))
         local slot_h = math.max(8, math.floor(slot_w * 3 / 2))
@@ -626,6 +646,54 @@ local function installCollectionsViewPlugin()
             slot_w = math.max(8, math.floor(slot_h * 2 / 3))
         end
         return slot_w, slot_h
+    end
+
+    local function buildSimpleUILabelWidget(label, image_w, image_h, cv_scale)
+        local text_width = math.max(20, image_w - SIMPLEUI_LATERAL_PAD * 2)
+        local max_fs = math.max(8, math.floor(getSimpleUILabelBaseFontSize() * cv_scale))
+        local min_fs = 8
+        local fixed_font_size = BookInfoManager:getSetting("fixed_item_font_size")
+        local font_size = max_fs
+        local display_label = BD.directory(label)
+        local max_lines = 3
+
+        local function makeDisplayLabel(text)
+            if G_reader_settings:nilOrTrue("use_xtext") then
+                return text
+                    :gsub("/", "/\u{200B}")
+                    :gsub("_", "_\u{200B}")
+                    :gsub("%-", "-\u{200B}")
+                    :gsub("%.", ".\u{200B}")
+            end
+            return text
+                :gsub("/", "/ ")
+                :gsub("_", "_ ")
+                :gsub("%-", "- ")
+                :gsub("%.", ". ")
+        end
+
+        display_label = makeDisplayLabel(display_label)
+
+        while true do
+            local directory = TextBoxWidget:new{
+                text = display_label,
+                face = Font:getFace("cfont", font_size),
+                width = text_width,
+                alignment = "center",
+                bold = true,
+            }
+
+            local line_height = directory.line_height_px or directory:getLineHeight()
+            local line_count = math.max(1, math.ceil(directory:getSize().h / line_height))
+            local fits = line_count <= max_lines and not directory.has_split_inside_word
+
+            if fixed_font_size or font_size <= min_fs or fits then
+                return directory
+            end
+
+            directory:free(true)
+            font_size = font_size - 1
+        end
     end
 
     local function buildSimpleUICollectionTile(tile_w, tile_h, cover_file, label, count)
@@ -704,17 +772,7 @@ local function installCollectionsViewPlugin()
         local overlap = OverlapGroup:new{ dimen = cover_dimen, cover_group }
 
         if getSimpleUILabelMode() == "overlay" and getSimpleUIShowName() then
-            local dir_max_fs = math.max(8, math.floor(SIMPLEUI_BASE_DIR_FS * cv_scale))
-            local directory = TextBoxWidget:new{
-                text = BD.directory(label),
-                face = Font:getFace("cfont", dir_max_fs),
-                width = math.max(20, image_w - SIMPLEUI_LATERAL_PAD * 2),
-                alignment = "center",
-                bold = true,
-                height = image_h,
-                height_adjust = true,
-                height_overflow_show_ellipsis = true,
-            }
+            local directory = buildSimpleUILabelWidget(label, image_w, image_h, cv_scale)
             local frame = FrameContainer:new{
                 padding = 0,
                 padding_top = SIMPLEUI_VERTICAL_PAD,
@@ -728,23 +786,26 @@ local function installCollectionsViewPlugin()
             local label_inner = getSimpleUILabelStyle() == "alpha"
                 and AlphaContainer:new{ alpha = SIMPLEUI_LABEL_ALPHA, frame }
                 or frame
-            local name_og = OverlapGroup:new{ dimen = Geom:new{ w = image_w + border * 2, h = image_h + border * 2 } }
-        local pos = getSimpleUILabelPosition()
-        if pos == "center" then
-                name_og[1] = CenterContainer:new{
-                    dimen = Geom:new{ w = image_w, h = image_h },
-                    label_inner,
-                    overlap_align = "center",
+            local img_only = Geom:new{ w = image_w, h = image_h }
+            local img_dimen = Geom:new{ w = image_w + border * 2, h = image_h + border * 2 }
+            local name_og = OverlapGroup:new{ dimen = img_dimen }
+            local pos = getSimpleUILabelPosition()
+            if pos == "center" then
+                name_og[1] = label_inner
+                local label_size = label_inner:getSize()
+                name_og[1].overlap_offset = {
+                    math.floor((img_only.w - label_size.w) / 2),
+                    math.floor((img_only.h - label_size.h) / 2),
                 }
             elseif pos == "top" then
                 name_og[1] = TopContainer:new{
-                    dimen = Geom:new{ w = image_w + border * 2, h = image_h + border * 2 },
+                    dimen = img_dimen,
                     label_inner,
                     overlap_align = "center",
                 }
             else
                 name_og[1] = BottomContainer:new{
-                    dimen = Geom:new{ w = image_w + border * 2, h = image_h + border * 2 },
+                    dimen = img_dimen,
                     label_inner,
                     overlap_align = "center",
                 }
@@ -775,6 +836,14 @@ local function installCollectionsViewPlugin()
             )
     end
 
+    local function isVirtualCoverEntry(entry)
+        return entry
+            and entry.is_collections_virtual
+            and not entry.is_file
+            and not entry.is_go_up
+            and not entry.is_go_back
+    end
+
     local function replaceItemWidget(self, widget)
         if self._underline_container[1] then
             self._underline_container[1]:free()
@@ -792,11 +861,10 @@ local function installCollectionsViewPlugin()
             h = self.height,
         }
         local label = self.entry.collection_label or (self.text and self.text:gsub("/$", "")) or ""
-        local cover_file = getDirectoryCoverFile(self.menu, self.entry)
         local widget, has_cover = buildSimpleUICollectionTile(
             dimen.w,
             dimen.h,
-            cover_file,
+            getDirectoryCoverFile(self.menu, self.entry),
             label,
             self.entry.virtual_count
         )
@@ -808,6 +876,20 @@ local function installCollectionsViewPlugin()
         end
         replaceItemWidget(self, widget)
         return true
+    end
+
+    local function paintVirtualCollectionMosaicItem(self, bb, x, y)
+        InputContainer.paintTo(self, bb, x, y)
+
+        if self.shortcut_icon then
+            local ix
+            if BD.mirroredUILayout() then
+                ix = self.dimen.w - self.shortcut_icon.dimen.w
+            else
+                ix = 0
+            end
+            self.shortcut_icon:paintTo(bb, x + ix, y)
+        end
     end
 
     local function getUpvalue(func, target_name)
@@ -833,9 +915,10 @@ local function installCollectionsViewPlugin()
             if MosaicMenuItem and not MosaicMenuItem._collectionsview_virtual_patch then
                 MosaicMenuItem._collectionsview_virtual_patch = true
                 local orig_update = MosaicMenuItem.update
+                local orig_paint = MosaicMenuItem.paintTo
                 local orig_onFocus = MosaicMenuItem.onFocus
-                function MosaicMenuItem:update(...)
-                    local result = orig_update(self, ...)
+                function MosaicMenuItem:update()
+                    local result = orig_update(self)
                     if renderDirectoryMosaicItem(self) then
                         return result
                     end
@@ -852,6 +935,12 @@ local function installCollectionsViewPlugin()
                             or Blitbuffer.COLOR_BLACK
                     end
                     return result
+                end
+                function MosaicMenuItem:paintTo(bb, x, y)
+                    if isVirtualCoverEntry(self.entry) then
+                        return paintVirtualCollectionMosaicItem(self, bb, x, y)
+                    end
+                    return orig_paint(self, bb, x, y)
                 end
             end
         end
@@ -909,7 +998,7 @@ local function installCollectionsViewPlugin()
             local entry = self:getListItem(nil, name, appendPath(path, encodeSegment(name)), {
                 mode = "directory",
                 size = count,
-                modification = last_access,
+                modification = 0,
                 access = last_access,
             }, collate)
             entry.is_directory = true
@@ -923,8 +1012,27 @@ local function installCollectionsViewPlugin()
             ::continue::
         end
 
+        local folder_sort_mode = G_reader_settings and G_reader_settings:readSetting(SETTINGS_FOLDER_SORT_MODE) or "collection_order"
         table.sort(dirs, function(a, b)
-            return a.text:lower() < b.text:lower()
+            local an = (a.collection_label or a.text or ""):lower()
+            local bn = (b.collection_label or b.text or ""):lower()
+            local aa = (a.attr and a.attr.access) or a.access or 0
+            local ba = (b.attr and b.attr.access) or b.access or 0
+            local aorder = (ReadCollection.coll_settings[a.collection_label or ""] and ReadCollection.coll_settings[a.collection_label or ""].order) or math.huge
+            local border = (ReadCollection.coll_settings[b.collection_label or ""] and ReadCollection.coll_settings[b.collection_label or ""].order) or math.huge
+
+            if folder_sort_mode == "collection_order" and aorder ~= border then
+                return aorder < border
+            elseif folder_sort_mode == "title_desc" and an ~= bn then
+                return an > bn
+            elseif folder_sort_mode == "title_asc" and an ~= bn then
+                return an < bn
+            end
+
+            if an ~= bn then
+                return an < bn
+            end
+            return tostring(a.path or "") < tostring(b.path or "")
         end)
         return dirs
     end
@@ -938,17 +1046,12 @@ local function installCollectionsViewPlugin()
 
         local collate = self:getCollate()
         for _, entry in ipairs(getCollectionItems(collection_name)) do
-            local basename = entry.file and entry.file:match("([^/]+)$") or entry.file
-            if basename and basename:sub(1, 1) == "." then
-                goto continue
-            end
             local attributes = entry.attr or { mode = "file" }
-            local display = entry.text or basename or entry.file
+            local display = entry.text or entry.file:match("([^/]+)$") or entry.file
             local item = self:getListItem(path, display, entry.file, attributes, collate)
             item.is_file = true
             item.is_collections_virtual = true
             table.insert(files, item)
-            ::continue::
         end
         return files
     end
@@ -957,6 +1060,7 @@ local function installCollectionsViewPlugin()
     local currently_in_collections = false
     local active_virtual_display_mode = nil
     local last_virtual_path = nil
+    local restoreFileManagerDisplayMode
 
     local function applyDisplayModeTemporarily(target_mode)
         if not target_mode then
@@ -1003,7 +1107,7 @@ local function installCollectionsViewPlugin()
         active_virtual_display_mode = target_mode
     end
 
-    local function restoreFileManagerDisplayMode()
+    restoreFileManagerDisplayMode = function()
         if not currently_in_collections then
             return
         end
@@ -1165,6 +1269,7 @@ local function installCollectionsViewPlugin()
 
         self.path = self._cb_virtual_path
         self.item_table = item_table
+        self.path_items = self.path_items or {}
 
         local itemnumber = self.path_items[self._cb_virtual_path]
         if type(itemmatch) == "table" then
@@ -1496,8 +1601,20 @@ function CollectionsView:addToMainMenu(menu_items)
             or "bottom"
     end
 
+    local function currentLabelFontSize()
+        local value = G_reader_settings and G_reader_settings:readSetting(SETTINGS_LABEL_FONT_SIZE)
+        if type(value) == "number" then
+            return value
+        end
+        return 5
+    end
+
     local function currentSortMode()
         return (G_reader_settings and G_reader_settings:readSetting(SETTINGS_SORT_MODE)) or "collection_order"
+    end
+
+    local function currentFolderSortMode()
+        return (G_reader_settings and G_reader_settings:readSetting(SETTINGS_FOLDER_SORT_MODE)) or "collection_order"
     end
 
     local function currentHideUnderline()
@@ -1530,7 +1647,7 @@ function CollectionsView:addToMainMenu(menu_items)
         return items
     end
 
-    local function makeSortModeItems()
+    local function makeFileSortModeItems()
         local modes = {
             { id = "collection_order", text = _("Collection order") },
             { id = "title_asc", text = _("Title A-Z") },
@@ -1555,6 +1672,27 @@ function CollectionsView:addToMainMenu(menu_items)
         return items
     end
 
+    local function makeFolderSortModeItems()
+        local modes = {
+            { id = "collection_order", text = _("Collection Folder") },
+            { id = "title_asc", text = _("Title A-Z") },
+            { id = "title_desc", text = _("Title Z-A") },
+        }
+        local items = {}
+        for _, mode in ipairs(modes) do
+            items[#items + 1] = {
+                text = mode.text,
+                checked_func = function()
+                    return currentFolderSortMode() == mode.id
+                end,
+                callback = function()
+                    saveAndRefresh(SETTINGS_FOLDER_SORT_MODE, mode.id)
+                end,
+            }
+        end
+        return items
+    end
+
     menu_items.collectionsview = {
         sorting_hint = "tools",
         text = _("Collections View"),
@@ -1568,6 +1706,25 @@ function CollectionsView:addToMainMenu(menu_items)
                     })[currentLabelPosition()] or _("Bottom"))
                 end,
                 sub_item_table_func = makeLabelPositionItems,
+            },
+            {
+                text_func = function()
+                    return T(_("Folder label font size: %1"), currentLabelFontSize())
+                end,
+                callback = function()
+                    local SpinWidget = require("ui/widget/spinwidget")
+                    UIManager:show(SpinWidget:new{
+                        title_text = _("Folder label font size"),
+                        value = currentLabelFontSize(),
+                        value_min = 3,
+                        value_max = 12,
+                        default_value = 5,
+                        callback = function(spin)
+                            G_reader_settings:saveSetting(SETTINGS_LABEL_FONT_SIZE, spin.value)
+                            self:_refreshCollectionsView()
+                        end,
+                    })
+                end,
             },
             {
                 text_func = function()
@@ -1640,7 +1797,18 @@ function CollectionsView:addToMainMenu(menu_items)
                     }
                     return T(_("Arrange files by: %1"), labels[currentSortMode()] or _("Collection order"))
                 end,
-                sub_item_table_func = makeSortModeItems,
+                sub_item_table_func = makeFileSortModeItems,
+            },
+            {
+                text_func = function()
+                    local labels = {
+                        collection_order = _("Collection order"),
+                        title_asc = _("Title A-Z"),
+                        title_desc = _("Title Z-A"),
+                    }
+                    return T(_("Arrange collection folders by: %1"), labels[currentFolderSortMode()] or _("Collection order"))
+                end,
+                sub_item_table_func = makeFolderSortModeItems,
             },
         },
     }
