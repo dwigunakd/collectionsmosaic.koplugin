@@ -22,7 +22,6 @@ local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local _ = require("gettext")
 local BD = require("ui/bidi")
-local PTResource = require("ptresource")
 local TopContainer = require("ui/widget/container/topcontainer")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
@@ -74,7 +73,7 @@ local function installCollectionsViewPlugin()
     local FOLDER_COVER_EXTS = { ".jpg", ".jpeg", ".png", ".webp", ".gif" }
     local DIR_COVER_CACHE_MAX = 96
     local IMAGE_DIM_CACHE_MAX = 48
-    local SHOW_FAVORITES_COLLECTION = false
+    local SHOW_FAVORITES_COLLECTION = true
     local SIMPLEUI_EDGE_H1 = 0.97
     local SIMPLEUI_EDGE_H2 = 0.94
     local SIMPLEUI_FC_SHOW_NAME = "simpleui_fc_show_name"
@@ -993,7 +992,6 @@ local function installCollectionsViewPlugin()
             if count == 0 then
                 goto continue
             end
-
             local last_access = getCollectionLastAccessTime(coll)
             local entry = self:getListItem(nil, name, appendPath(path, encodeSegment(name)), {
                 mode = "directory",
@@ -1564,7 +1562,6 @@ local function installCollectionsViewPlugin()
 end
 
 function CollectionsView:init()
-    PTResource.installIcons()
     installCollectionsViewPlugin()
     if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
         self.ui.menu:registerToMainMenu(self)
