@@ -33,6 +33,7 @@ local CollectionsView = WidgetContainer:extend{
 }
 
 local patched = false
+local registerVirtualCollectionFileDialogButtons = nil
 local SETTINGS_ROOT_LABEL = "zcollectionsview_root_label"
 local SETTINGS_LABEL_POSITION = "zcollectionsview_label_position"
 local SETTINGS_LABEL_FONT_SIZE = "zcollectionsview_label_font_size"
@@ -52,19 +53,23 @@ local function getHideUnderlineSetting()
 end
 
 local function installCollectionsViewPlugin()
-    if patched then
-        return
-    end
-    patched = true
-
     local FileChooser = require("ui/widget/filechooser")
+    local FileManager = require("apps/filemanager/filemanager")
     local FileManagerCollection = require("apps/filemanager/filemanagercollection")
     local ReadCollection = require("readcollection")
     local UIManager = require("ui/uimanager")
     local filemanagerutil = require("apps/filemanager/filemanagerutil")
     local util = require("util")
     local BookInfoManager = require("bookinfomanager")
+    local ConfirmBox = require("ui/widget/confirmbox")
     local T = ffiUtil.template
+
+    if patched then
+        return {
+            addVirtualCollectionFileDialogButtons = registerVirtualCollectionFileDialogButtons,
+        }
+    end
+    patched = true
 
     local COLLECTIONS_SYMBOL = "\u{272A}"
     local COLLECTIONS_SEGMENT = COLLECTIONS_SYMBOL .. " " .. _("Collections")
@@ -151,17 +156,18 @@ local function installCollectionsViewPlugin()
             return cached.w, cached.h
         end
 
+        local probe
         local ok, w, h = pcall(function()
-            local probe = ImageWidget:new{
+            probe = ImageWidget:new{
                 file = filepath,
                 scale_factor = 1,
             }
             probe:_render()
-            local orig_w = probe:getOriginalWidth()
-            local orig_h = probe:getOriginalHeight()
-            probe:free()
-            return orig_w, orig_h
+            return probe:getOriginalWidth(), probe:getOriginalHeight()
         end)
+        if probe then
+            probe:free()
+        end
         if not ok or not w or not h or w <= 0 or h <= 0 then
             return nil, nil
         end
@@ -267,6 +273,17 @@ local function installCollectionsViewPlugin()
             return decodeSegment(encoded)
         end
         return nil
+    end
+
+    local function getActiveVirtualCollectionName(fc)
+        if not fc then
+            return nil
+        end
+        local virtual_path = fc._cb_virtual_path or fc.path
+        if not virtual_path or isCollectionsRoot(virtual_path) then
+            return nil
+        end
+        return getCollectionFromPath(virtual_path)
     end
 
     local function getCollectionsRootPath(path)
@@ -567,20 +584,24 @@ local function installCollectionsViewPlugin()
             if not orig_w or not orig_h then
                 return nil
             end
-            local ok, image = pcall(function()
+            local image
+            local ok = pcall(function()
                 local scale = math.max(max_w / orig_w, max_h / orig_h)
-                return ImageWidget:new{
+                image = ImageWidget:new{
                     file = filepath,
                     scale_factor = scale,
                     width = max_w,
                     height = max_h,
                 }
-            end)
-            if ok then
                 image:_render()
-                return image
+            end)
+            if not ok then
+                if image then
+                    image:free()
+                end
+                return nil
             end
-            return nil
+            return image
         end
 
         local cover_specs = {
@@ -1557,12 +1578,106 @@ local function installCollectionsViewPlugin()
         return orig_showCollListDialog(self, wrapped_callback, no_dialog)
     end
 
+    local orig_onMenuHold = FileManagerCollection.onMenuHold
+    function FileManagerCollection:onMenuHold(item)
+        if self.ui then
+            self.ui._cb_in_stock_collection_hold = true
+        end
+        local ok, result = pcall(orig_onMenuHold, self, item)
+        if self.ui then
+            self.ui._cb_in_stock_collection_hold = nil
+        end
+        if not ok then
+            error(result)
+        end
+        return result
+    end
+
+    local orig_getPlusDialogButtons = FileManager.getPlusDialogButtons
+    function FileManager:getPlusDialogButtons()
+        local title, buttons = orig_getPlusDialogButtons(self)
+        local collection_name = getActiveVirtualCollectionName(self.file_chooser)
+        if not self.selected_files or not collection_name or not buttons then
+            return title, buttons
+        end
+
+        local actions_enabled = util.tableSize(self.selected_files) > 0
+        local remove_button_row = {
+            {
+                text = _("Remove from collection"),
+                enabled = actions_enabled,
+                callback = function()
+                    UIManager:show(ConfirmBox:new{
+                        text = _("Remove selected books from collection?"),
+                        ok_text = _("Remove"),
+                        ok_callback = function()
+                            UIManager:close(self.plus_dialog)
+                            local selected_files = self.selected_files
+                            for file in pairs(selected_files) do
+                                ReadCollection:removeItem(file, collection_name, true)
+                            end
+                            ReadCollection:write({ [collection_name] = true })
+                            self:onToggleSelectMode(true)
+                        end,
+                    })
+                end,
+            },
+        }
+
+        local insert_idx = math.min(6, #buttons + 1)
+        table.insert(buttons, insert_idx, remove_button_row)
+        return title, buttons
+    end
+
+    local function addVirtualCollectionFileDialogButtons(ui)
+        if not ui or not ui.addFileDialogButtons then
+            return
+        end
+
+        if ui.removeFileDialogButtons then
+            ui:removeFileDialogButtons("collectionsview_remove_from_collection")
+        end
+        ui:addFileDialogButtons("collectionsview_remove_from_collection", function(file, is_file)
+            local fc = ui.file_chooser
+            local collection_name = getActiveVirtualCollectionName(fc)
+            if not is_file or not collection_name or ui._cb_in_stock_collection_hold then
+                return nil
+            end
+
+            return {
+                {
+                    text = _("Remove from collection"),
+                    callback = function()
+                        local current_fc = ui.file_chooser
+                        local current_collection = getActiveVirtualCollectionName(current_fc)
+                        if current_fc and current_fc.file_dialog then
+                            UIManager:close(current_fc.file_dialog)
+                        end
+                        if current_collection then
+                            ReadCollection:removeItem(file, current_collection)
+                        end
+                        if current_fc then
+                            current_fc:refreshPath()
+                        end
+                    end,
+                },
+            }
+        end)
+    end
+    registerVirtualCollectionFileDialogButtons = addVirtualCollectionFileDialogButtons
+
     patchCoverBrowserVirtualRenderers()
     logger.info("CollectionsView plugin installed")
+    return {
+        addVirtualCollectionFileDialogButtons = addVirtualCollectionFileDialogButtons,
+    }
 end
 
 function CollectionsView:init()
-    installCollectionsViewPlugin()
+    local hooks = installCollectionsViewPlugin()
+    if hooks and hooks.addVirtualCollectionFileDialogButtons then
+        hooks.addVirtualCollectionFileDialogButtons(self.ui)
+    end
     if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
         self.ui.menu:registerToMainMenu(self)
     end
