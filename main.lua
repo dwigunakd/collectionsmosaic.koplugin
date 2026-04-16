@@ -58,6 +58,11 @@ local function installCollectionsViewPlugin()
     local FileManagerCollection = require("apps/filemanager/filemanagercollection")
     local ReadCollection = require("readcollection")
     local UIManager = require("ui/uimanager")
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local InfoMessage = require("ui/widget/infomessage")
+    local InputDialog = require("ui/widget/inputdialog")
+    local Menu = require("ui/widget/menu")
+    local PathChooser = require("ui/widget/pathchooser")
     local filemanagerutil = require("apps/filemanager/filemanagerutil")
     local util = require("util")
     local BookInfoManager = require("bookinfomanager")
@@ -95,9 +100,13 @@ local function installCollectionsViewPlugin()
     local SIMPLEUI_VERTICAL_PAD = Screen:scaleBySize(4)
     local SIMPLEUI_LABEL_ALPHA = 0.75
     local dir_cover_cache = {}
-    local dir_cover_cache_order = {}
+    local dir_cover_cache_keys = {}   -- ring buffer
+    local dir_cover_cache_head = 1    -- next slot to evict
+    local dir_cover_cache_count = 0
     local image_dim_cache = {}
-    local image_dim_cache_order = {}
+    local image_dim_cache_keys = {}   -- ring buffer
+    local image_dim_cache_head = 1
+    local image_dim_cache_count = 0
 
     local function getDirPathMtime(dir_path)
         if not dir_path then
@@ -107,25 +116,26 @@ local function installCollectionsViewPlugin()
         return attr and attr.modification or nil
     end
 
-    local function pruneDirCoverCache()
-        while #dir_cover_cache_order > DIR_COVER_CACHE_MAX do
-            local oldest = table.remove(dir_cover_cache_order, 1)
-            dir_cover_cache[oldest] = nil
-        end
-    end
-
     local function storeDirCoverCache(dir_path, mtime, cover_file)
-        if not dir_path or not cover_file then
+        if not dir_path then
             return cover_file
         end
         if not dir_cover_cache[dir_path] then
-            dir_cover_cache_order[#dir_cover_cache_order + 1] = dir_path
+            -- New entry: claim a ring-buffer slot
+            if dir_cover_cache_count < DIR_COVER_CACHE_MAX then
+                dir_cover_cache_count = dir_cover_cache_count + 1
+                dir_cover_cache_keys[dir_cover_cache_count] = dir_path
+            else
+                -- Evict the oldest slot
+                local old_key = dir_cover_cache_keys[dir_cover_cache_head]
+                if old_key then
+                    dir_cover_cache[old_key] = nil
+                end
+                dir_cover_cache_keys[dir_cover_cache_head] = dir_path
+                dir_cover_cache_head = (dir_cover_cache_head % DIR_COVER_CACHE_MAX) + 1
+            end
         end
-        dir_cover_cache[dir_path] = {
-            modification = mtime,
-            cover_file = cover_file,
-        }
-        pruneDirCoverCache()
+        dir_cover_cache[dir_path] = { modification = mtime, cover_file = cover_file }
         return cover_file
     end
 
@@ -133,16 +143,9 @@ local function installCollectionsViewPlugin()
         local mtime = getDirPathMtime(dir_path)
         local cached = dir_cover_cache[dir_path]
         if cached and cached.modification == mtime then
-            return true, cached.cover_file or nil
+            return true, cached.cover_file
         end
         return false, mtime
-    end
-
-    local function pruneImageDimCache()
-        while #image_dim_cache_order > IMAGE_DIM_CACHE_MAX do
-            local oldest = table.remove(image_dim_cache_order, 1)
-            image_dim_cache[oldest] = nil
-        end
     end
 
     local function getCachedImageDimensions(filepath)
@@ -173,14 +176,20 @@ local function installCollectionsViewPlugin()
         end
 
         if not image_dim_cache[filepath] then
-            image_dim_cache_order[#image_dim_cache_order + 1] = filepath
+            -- New entry: claim a ring-buffer slot
+            if image_dim_cache_count < IMAGE_DIM_CACHE_MAX then
+                image_dim_cache_count = image_dim_cache_count + 1
+                image_dim_cache_keys[image_dim_cache_count] = filepath
+            else
+                local old_key = image_dim_cache_keys[image_dim_cache_head]
+                if old_key then
+                    image_dim_cache[old_key] = nil
+                end
+                image_dim_cache_keys[image_dim_cache_head] = filepath
+                image_dim_cache_head = (image_dim_cache_head % IMAGE_DIM_CACHE_MAX) + 1
+            end
         end
-        image_dim_cache[filepath] = {
-            modification = mtime,
-            w = w,
-            h = h,
-        }
-        pruneImageDimCache()
+        image_dim_cache[filepath] = { modification = mtime, w = w, h = h }
         return w, h
     end
 
@@ -415,10 +424,6 @@ local function installCollectionsViewPlugin()
         return COLLECTIONS_SYMBOL .. " " .. getCollectionsRootLabel()
     end
 
-    local function getCoverOverrides()
-        return G_reader_settings and G_reader_settings:readSetting(COVER_OVERRIDE_KEY) or {}
-    end
-
     local function isImageFilePath(filepath)
         if type(filepath) ~= "string" then
             return false
@@ -441,17 +446,17 @@ local function installCollectionsViewPlugin()
         end
 
         local bookinfo = BookInfoManager:getBookInfo(filepath, true)
-        if not bookinfo or not bookinfo.cover_fetched or not bookinfo.has_cover or bookinfo.ignore_cover or not bookinfo.cover_bb then
-            if bookinfo and bookinfo.cover_bb then
-                bookinfo.cover_bb:free()
-            end
+        if not bookinfo or not bookinfo.cover_fetched or not bookinfo.has_cover or bookinfo.ignore_cover then
             return false
         end
+        if not bookinfo.cover_bb then
+            return false
+        end
+        -- cover_bb is owned by the cache; do not free it here
         return true
     end
 
-    local function getCollectionCoverFile(collection_name)
-        local overrides = getCoverOverrides()
+    local function getCollectionCoverFile(collection_name, overrides)
         local override_path = overrides and overrides[collection_name]
         if type(override_path) == "string" and hasUsableBookCover(override_path) then
             return override_path
@@ -466,6 +471,7 @@ local function installCollectionsViewPlugin()
     end
 
     local function getCollectionsRootCoverFile()
+        local overrides = G_reader_settings and G_reader_settings:readSetting(COVER_OVERRIDE_KEY) or {}
         local names = {}
         for name, _ in pairs(ReadCollection.coll) do
             if SHOW_FAVORITES_COLLECTION
@@ -478,7 +484,7 @@ local function installCollectionsViewPlugin()
         end)
 
         for _, name in ipairs(names) do
-            local cover_file = getCollectionCoverFile(name)
+            local cover_file = getCollectionCoverFile(name, overrides)
             if cover_file then
                 return cover_file
             end
@@ -609,16 +615,11 @@ local function installCollectionsViewPlugin()
             max_cover_h = max_h,
         }
         local bookinfo = BookInfoManager:getBookInfo(filepath, true)
-        if not bookinfo or not bookinfo.cover_fetched or not bookinfo.has_cover or bookinfo.ignore_cover then
-            if bookinfo and bookinfo.cover_bb then
-                bookinfo.cover_bb:free()
-            end
+        if not bookinfo or not bookinfo.cover_fetched or not bookinfo.has_cover
+                or bookinfo.ignore_cover or not bookinfo.cover_bb then
             return nil
         end
         if BookInfoManager.isCachedCoverInvalid(bookinfo, cover_specs) then
-            if bookinfo.cover_bb then
-                bookinfo.cover_bb:free()
-            end
             return nil
         end
 
@@ -1003,6 +1004,8 @@ local function installCollectionsViewPlugin()
     local function buildCollectionDirItems(self, path)
         local dirs = {}
         local collate = self:getCollate()
+        -- Read cover overrides once for the whole pass instead of per-collection
+        local overrides = G_reader_settings and G_reader_settings:readSetting(COVER_OVERRIDE_KEY) or {}
         for name, coll in pairs(ReadCollection.coll) do
             if not SHOW_FAVORITES_COLLECTION
                 and name:lower() == ReadCollection.default_collection_name:lower() then
@@ -1024,7 +1027,7 @@ local function installCollectionsViewPlugin()
             entry.is_collections_virtual = true
             entry.collection_label = name
             entry.virtual_count = count
-            entry.virtual_cover_file = getCollectionCoverFile(name)
+            entry.virtual_cover_file = getCollectionCoverFile(name, overrides)
             entry.mandatory = T("%1 \u{F016}", count)
             table.insert(dirs, entry)
 
@@ -1179,6 +1182,20 @@ local function installCollectionsViewPlugin()
 
         local collection_name = getCollectionFromPath(effective_path)
         if collection_name then
+            -- Scan any connected folders that have scan_on_show enabled before building the list
+            local coll_settings = collection_name and ReadCollection.coll_settings[collection_name] or nil
+            local folders = coll_settings and coll_settings.folders
+            if folders then
+                for _, folder_settings in pairs(folders) do
+                    if folder_settings.scan_on_show then
+                        -- updateCollectionFromFolder rescans all connected folders for this collection at once
+                        logger.dbg("CollectionsView plugin: scan_on_show triggered for", collection_name)
+                        ReadCollection:updateCollectionFromFolder(collection_name)
+                        ReadCollection:write()
+                        break
+                    end
+                end
+            end
             local files = buildCollectionFileItems(self, effective_path, collection_name)
             logger.dbg("CollectionsView plugin: building collection", collection_name, #files)
             return composeVirtualItemTable({}, files, effective_path)
@@ -1371,6 +1388,473 @@ local function installCollectionsViewPlugin()
         end
     end
 
+    local function isVirtualCollectionDirectoryItem(item)
+        return item and item.is_collections_virtual and not item.is_file
+    end
+
+    local function getCollectionsRootPathFor(fc, path)
+        return getCollectionsRootPath(path or (fc and (fc._cb_virtual_path or fc.path)))
+            or appendPath(getHomeDir(), COLLECTIONS_SEGMENT)
+    end
+
+    local function getVirtualCollectionPath(fc, collection_name, path)
+        if not collection_name then
+            return nil
+        end
+        return appendPath(getCollectionsRootPathFor(fc, path), encodeSegment(collection_name))
+    end
+
+    local function getCollectionFolderMandatory(folder_settings)
+        if folder_settings.subfolders and folder_settings.scan_on_show then
+            return "\u{F441} \u{F114}"
+        elseif folder_settings.subfolders then
+            return "\u{F114}"
+        elseif folder_settings.scan_on_show then
+            return "\u{F441}"
+        end
+        return nil
+    end
+
+    local function markCollectionsUpdated(names)
+        local fm = FileManager and FileManager.instance
+        local collections = fm and fm.collections
+        if not collections or not names then
+            return
+        end
+        for _, name in ipairs(names) do
+            if name then
+                collections.updated_collections[name] = true
+            end
+        end
+        collections.files_updated = true
+    end
+
+    local function refreshVirtualCollectionsView(fc, target_path)
+        if not fc then
+            return
+        end
+        if target_path and fc.changeToPath then
+            fc:changeToPath(target_path)
+        elseif fc.refreshPath then
+            fc:refreshPath()
+        end
+    end
+
+    local function commitVirtualCollectionChanges(fc, changed_names, target_path)
+        ReadCollection:write()
+        markCollectionsUpdated(changed_names)
+        refreshVirtualCollectionsView(fc, target_path)
+    end
+
+    local function getCollectionSettings(collection_name)
+        return collection_name and ReadCollection.coll_settings[collection_name] or nil
+    end
+
+    local function getConnectedFoldersItemTable(collection_name)
+        local item_table = {}
+        local coll_settings = getCollectionSettings(collection_name)
+        local folders = coll_settings and coll_settings.folders or nil
+        if folders then
+            for folder, folder_settings in pairs(folders) do
+                -- Store folder path in both text (display) and path (navigation)
+                table.insert(item_table, {
+                    text = folder,
+                    path = folder,
+                    mandatory = getCollectionFolderMandatory(folder_settings),
+                })
+            end
+            if #item_table > 1 then
+                table.sort(item_table, function(a, b) return ffiUtil.strcoll(a.text, b.text) end)
+            end
+        end
+        return item_table
+    end
+
+    local function updateConnectedFoldersMenu(menu, collection_name)
+        if not menu then
+            return
+        end
+        local item_table = getConnectedFoldersItemTable(collection_name)
+        local subtitle = T(_("Connected folders: %1"), #item_table)
+        menu:switchItemTable(nil, item_table, -1, nil, subtitle)
+    end
+
+    local function connectFolderToVirtualCollection(fc, collection_name)
+        if not collection_name then
+            return
+        end
+
+        UIManager:show(PathChooser:new{
+            path = G_reader_settings:readSetting("home_dir"),
+            select_file = false,
+            onConfirm = function(folder)
+                local coll_settings = getCollectionSettings(collection_name)
+                if not coll_settings then
+                    return
+                end
+                coll_settings.folders = coll_settings.folders or {}
+                if coll_settings.folders[folder] ~= nil then
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Folder already connected: %1"), folder),
+                    })
+                    return
+                end
+
+                coll_settings.folders[folder] = { subfolders = false }
+                ReadCollection:updateCollectionFromFolder(collection_name)
+                commitVirtualCollectionChanges(fc, { collection_name })
+            end,
+        })
+    end
+
+    local function showConnectedFolderActions(fc, collection_name, folder, parent_menu)
+        local coll_settings = getCollectionSettings(collection_name)
+        local folder_settings = coll_settings and coll_settings.folders and coll_settings.folders[folder] or nil
+        if not folder_settings then
+            return
+        end
+
+        local button_dialog
+        button_dialog = ButtonDialog:new{
+            title = folder,
+            title_align = "center",
+            buttons = {
+                {
+                    {
+                        text = _("Open"),
+                        callback = function()
+                            UIManager:close(button_dialog)
+                            UIManager:close(parent_menu)
+                            if fc and fc.changeToPath then
+                                UIManager:nextTick(function()
+                                    fc:changeToPath(folder)
+                                end)
+                            end
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = _("Scan folder now"),
+                        callback = function()
+                            UIManager:close(button_dialog)
+                            ReadCollection:updateCollectionFromFolder(collection_name)
+                            commitVirtualCollectionChanges(fc, { collection_name })
+                            updateConnectedFoldersMenu(parent_menu, collection_name)
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = _("Scan folder on showing collection"),
+                        checked_func = function()
+                            return folder_settings.scan_on_show == true
+                        end,
+                        callback = function()
+                            folder_settings.scan_on_show = not folder_settings.scan_on_show
+                            commitVirtualCollectionChanges(fc, { collection_name })
+                            updateConnectedFoldersMenu(parent_menu, collection_name)
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = _("Include subfolders"),
+                        checked_func = function()
+                            return folder_settings.subfolders == true
+                        end,
+                        callback = function()
+                            folder_settings.subfolders = not folder_settings.subfolders
+                            if folder_settings.subfolders then
+                                ReadCollection:updateCollectionFromFolder(collection_name)
+                            end
+                            commitVirtualCollectionChanges(fc, { collection_name })
+                            updateConnectedFoldersMenu(parent_menu, collection_name)
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = _("Disconnect folder"),
+                        callback = function()
+                            UIManager:close(button_dialog)
+                            -- Normalize folder path for prefix matching
+                            local folder_prefix = folder:sub(-1) == "/" and folder or (folder .. "/")
+                            local coll = ReadCollection.coll[collection_name]
+                            if coll then
+                                local to_remove = {}
+                                for file_path in pairs(coll) do
+                                    if file_path == folder
+                                        or file_path:sub(1, #folder_prefix) == folder_prefix
+                                    then
+                                        to_remove[#to_remove + 1] = file_path
+                                    end
+                                end
+                                for _, file_path in ipairs(to_remove) do
+                                    ReadCollection:removeItem(file_path, collection_name, true)
+                                end
+                                if #to_remove > 0 then
+                                    ReadCollection:write({ [collection_name] = true })
+                                end
+                            end
+                            coll_settings.folders[folder] = nil
+                            if next(coll_settings.folders) == nil then
+                                coll_settings.folders = nil
+                            end
+                            commitVirtualCollectionChanges(fc, { collection_name })
+                            updateConnectedFoldersMenu(parent_menu, collection_name)
+                        end,
+                    },
+                },
+                {
+                    {
+                        text = _("Close"),
+                        callback = function()
+                            UIManager:close(button_dialog)
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(button_dialog)
+    end
+
+    local function showConnectedFoldersMenu(fc, collection_name)
+        if not collection_name then
+            return
+        end
+
+        local folder_menu
+        folder_menu = Menu:new{
+            path = collection_name,
+            title = collection_name,
+            subtitle = "",
+            covers_fullscreen = true,
+            is_borderless = true,
+            is_popout = false,
+            title_bar_fm_style = true,
+            title_bar_left_icon = "plus",
+            onLeftButtonTap = function()
+                UIManager:close(folder_menu)
+                connectFolderToVirtualCollection(fc, collection_name)
+            end,
+            -- Called as self:onMenuChoice(item) by Menu internals, so first arg is the menu, second is the item
+            onMenuChoice = function(_, item)
+                UIManager:close(folder_menu)
+                local real_path = item.path or item.text
+                if fc and fc.changeToPath and real_path then
+                    UIManager:nextTick(function()
+                        fc:changeToPath(real_path)
+                    end)
+                end
+            end,
+            -- Called as self:onMenuHold(item) by Menu internals
+            onMenuHold = function(_, item)
+                local real_path = item.path or item.text
+                showConnectedFolderActions(fc, collection_name, real_path, folder_menu)
+                return true
+            end,
+            ui = fc and fc.ui or nil,
+        }
+        folder_menu.close_callback = function()
+            UIManager:close(folder_menu)
+        end
+        updateConnectedFoldersMenu(folder_menu, collection_name)
+        UIManager:show(folder_menu)
+    end
+
+    local function editVirtualCollectionName(fc, collection_name, item_path)
+        if not collection_name or collection_name == ReadCollection.default_collection_name then
+            return
+        end
+
+        local input_dialog
+        input_dialog = InputDialog:new{
+            title = _("Enter collection name"),
+            input = collection_name,
+            input_hint = collection_name,
+            buttons = {{
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(input_dialog)
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    callback = function()
+                        local new_name = input_dialog:getInputText()
+                        if new_name == "" or new_name == collection_name then
+                            return
+                        end
+                        if ReadCollection.coll[new_name] then
+                            UIManager:show(InfoMessage:new{
+                                text = T(_("Collection already exists: %1"), new_name),
+                            })
+                            return
+                        end
+
+                        UIManager:close(input_dialog)
+                        ReadCollection:renameCollection(collection_name, new_name)
+                        local target_path
+                        if getActiveVirtualCollectionName(fc) == collection_name then
+                            target_path = getVirtualCollectionPath(fc, new_name, item_path)
+                        end
+                        commitVirtualCollectionChanges(fc, { collection_name, new_name }, target_path)
+                    end,
+                },
+            }},
+        }
+        UIManager:show(input_dialog)
+        input_dialog:onShowKeyboard()
+    end
+
+    local function createNewVirtualCollection(fc)
+        local input_dialog
+        input_dialog = InputDialog:new{
+            title = _("New collection"),
+            input = "",
+            input_hint = _("Collection name"),
+            buttons = {{
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(input_dialog)
+                    end,
+                },
+                {
+                    text = _("Create"),
+                    is_enter_default = true,
+                    callback = function()
+                        local new_name = trimString(input_dialog:getInputText())
+                        if not new_name or new_name == "" then
+                            return
+                        end
+                        if ReadCollection.coll[new_name] then
+                            UIManager:show(InfoMessage:new{
+                                text = T(_("Collection already exists: %1"), new_name),
+                            })
+                            return
+                        end
+                        UIManager:close(input_dialog)
+                        ReadCollection:addCollection(new_name)
+                        commitVirtualCollectionChanges(fc, { new_name })
+                    end,
+                },
+            }},
+        }
+        UIManager:show(input_dialog)
+        input_dialog:onShowKeyboard()
+    end
+
+    local function removeVirtualCollection(fc, collection_name, item_path)
+        if not collection_name or collection_name == ReadCollection.default_collection_name then
+            return
+        end
+
+        UIManager:show(ConfirmBox:new{
+            text = _("Remove collection?") .. "\n\n" .. collection_name,
+            ok_text = _("Remove"),
+            ok_callback = function()
+                ReadCollection:removeCollection(collection_name)
+                local target_path
+                if getActiveVirtualCollectionName(fc) == collection_name then
+                    target_path = getCollectionsRootPathFor(fc, item_path)
+                end
+                commitVirtualCollectionChanges(fc, { collection_name }, target_path)
+            end,
+        })
+    end
+
+    local function showVirtualCollectionFolderDialog(fc, item)
+        if not fc or not isVirtualCollectionDirectoryItem(item) then
+            return false
+        end
+
+        local item_name = item.collection_label or (item.text and item.text:gsub("/$", "")) or _("Collection")
+        local collection_name = item.collection_label or getCollectionFromPath(item.path)
+        local is_root_item = item.path and isCollectionsRoot(item.path)
+        local is_default_collection = collection_name == ReadCollection.default_collection_name
+
+        local dialog
+        -- Build rows imperatively so no nil rows are ever passed to ButtonDialog
+        local buttons = {}
+
+        -- Row 1: Open + Connect folder (collection only)
+        local row1 = {
+            {
+                text = _("Open"),
+                callback = function()
+                    UIManager:close(dialog)
+                    fc:onMenuSelect(item)
+                end,
+            },
+        }
+        if not is_root_item then
+            row1[#row1 + 1] = {
+                text = _("Connect folder"),
+                callback = function()
+                    UIManager:close(dialog)
+                    connectFolderToVirtualCollection(fc, collection_name)
+                end,
+            }
+        end
+        buttons[#buttons + 1] = row1
+
+        -- Row 2: Connected folders (collection only)
+        if not is_root_item then
+            buttons[#buttons + 1] = {
+                {
+                    text = _("Connected folders"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        showConnectedFoldersMenu(fc, collection_name)
+                    end,
+                },
+            }
+        end
+
+        -- Row 3: Rename + Remove (non-default collection only)
+        if not is_root_item and not is_default_collection then
+            buttons[#buttons + 1] = {
+                {
+                    text = _("Rename collection"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        editVirtualCollectionName(fc, collection_name, item.path)
+                    end,
+                },
+                {
+                    text = _("Remove collection"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        removeVirtualCollection(fc, collection_name, item.path)
+                    end,
+                },
+            }
+        end
+
+        -- Last row: Close
+        buttons[#buttons + 1] = {
+            {
+                text = _("Close"),
+                callback = function()
+                    UIManager:close(dialog)
+                end,
+            },
+        }
+
+        dialog = ButtonDialog:new{
+            title = item_name,
+            title_align = "center",
+            buttons = buttons,
+        }
+        UIManager:show(dialog)
+        return true
+    end
+
     local function getWindowTitle(path)
         local effective_path = normalizeVirtualPath(path or "")
         if isCollectionsRoot(effective_path) then
@@ -1395,6 +1879,24 @@ local function installCollectionsViewPlugin()
         end
         syncVirtualTitleBar(self)
         return orig_refreshPath(self)
+    end
+
+    local orig_setupLayout = FileManager.setupLayout
+    function FileManager:setupLayout(...)
+        local result = orig_setupLayout(self, ...)
+        local fc = self.file_chooser
+        if fc and not fc._cb_virtual_dialog_patch then
+            fc._cb_virtual_dialog_patch = true
+
+            local orig_showFileDialog = fc.showFileDialog
+            fc.showFileDialog = function(chooser, item, ...)
+                if showVirtualCollectionFolderDialog(chooser, item) then
+                    return true
+                end
+                return orig_showFileDialog(chooser, item, ...)
+            end
+        end
+        return result
     end
 
     local function openVirtualPath(self, path, focused_path)
@@ -1596,8 +2098,31 @@ local function installCollectionsViewPlugin()
     local orig_getPlusDialogButtons = FileManager.getPlusDialogButtons
     function FileManager:getPlusDialogButtons()
         local title, buttons = orig_getPlusDialogButtons(self)
-        local collection_name = getActiveVirtualCollectionName(self.file_chooser)
-        if not self.selected_files or not collection_name or not buttons then
+        if not buttons then
+            return title, buttons
+        end
+
+        local fc = self.file_chooser
+        local virtual_path = fc and fc._cb_virtual_path
+
+        -- Inject "New collection" button when at the collections root
+        if virtual_path and isCollectionsRoot(virtual_path) then
+            local new_coll_row = {
+                {
+                    text = _("New collection"),
+                    callback = function()
+                        UIManager:close(self.plus_dialog)
+                        createNewVirtualCollection(fc)
+                    end,
+                },
+            }
+            table.insert(buttons, 1, new_coll_row)
+            return title, buttons
+        end
+
+        -- Inject "Remove from collection" in select mode inside a collection
+        local collection_name = getActiveVirtualCollectionName(fc)
+        if not self.selected_files or not collection_name then
             return title, buttons
         end
 
