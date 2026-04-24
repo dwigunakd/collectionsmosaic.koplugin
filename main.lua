@@ -33,6 +33,7 @@ local CollectionsView = WidgetContainer:extend{
 }
 
 local patched = false
+local dispatcher_actions_registered = false
 local registerVirtualCollectionFileDialogButtons = nil
 local SETTINGS_ROOT_LABEL = "zcollectionsview_root_label"
 local SETTINGS_LABEL_POSITION = "zcollectionsview_label_position"
@@ -40,6 +41,55 @@ local SETTINGS_LABEL_FONT_SIZE = "zcollectionsview_label_font_size"
 local SETTINGS_SORT_MODE = "zcollectionsview_sort_mode"
 local SETTINGS_FOLDER_SORT_MODE = "zcollectionsview_folder_sort_mode"
 local SETTINGS_HIDE_UNDERLINE = "zcollectionsview_hide_underline"
+local COLLECTIONS_SYMBOL = "\u{272A}"
+local COLLECTIONS_SEGMENT = COLLECTIONS_SYMBOL .. " " .. _("Collections")
+
+local function appendVirtualPath(base, segment)
+    if not base or base == "" then
+        return segment
+    end
+    if base:sub(-1) == "/" then
+        return base .. segment
+    end
+    return base .. "/" .. segment
+end
+
+local function normalizeVirtualPathString(path)
+    if not path or path == "" then
+        return path
+    end
+    while path:len() > 1 and path:sub(-1) == "/" do
+        path = path:sub(1, -2)
+    end
+    local leading_slash = path:sub(1, 1) == "/"
+    local segments = {}
+    for part in path:gmatch("[^/]+") do
+        if part == ".." then
+            table.remove(segments)
+        elseif part ~= "." and part ~= "" then
+            table.insert(segments, part)
+        end
+    end
+    local result = table.concat(segments, "/")
+    if leading_slash and result ~= "" then
+        result = "/" .. result
+    elseif leading_slash then
+        result = "/"
+    end
+    return result
+end
+
+local function getCollectionsHomeDir()
+    local filemanagerutil = require("apps/filemanager/filemanagerutil")
+    return normalizeVirtualPathString(
+        (G_reader_settings and G_reader_settings:readSetting("home_dir"))
+        or filemanagerutil.getDefaultDir()
+    )
+end
+
+local function getCollectionsVirtualRootPath()
+    return appendVirtualPath(getCollectionsHomeDir(), COLLECTIONS_SEGMENT)
+end
 
 local function getHideUnderlineSetting()
     if not G_reader_settings then
@@ -76,8 +126,6 @@ local function installCollectionsViewPlugin()
     end
     patched = true
 
-    local COLLECTIONS_SYMBOL = "\u{272A}"
-    local COLLECTIONS_SEGMENT = COLLECTIONS_SYMBOL .. " " .. _("Collections")
     local COVER_OVERRIDE_KEY = "navbar_collections_covers"
     local FOLDER_COVER_NAME = ".cover"
     local FOLDER_COVER_EXTS = { ".jpg", ".jpeg", ".png", ".webp", ".gif" }
@@ -207,47 +255,9 @@ local function installCollectionsViewPlugin()
         return (segment:gsub("\u{FF0F}", "/"))
     end
 
-    local function appendPath(base, segment)
-        if not base or base == "" then
-            return segment
-        end
-        if base:sub(-1) == "/" then
-            return base .. segment
-        end
-        return base .. "/" .. segment
-    end
-
-    local function normalizeVirtualPath(path)
-        if not path or path == "" then
-            return path
-        end
-        while path:len() > 1 and path:sub(-1) == "/" do
-            path = path:sub(1, -2)
-        end
-        local leading_slash = path:sub(1, 1) == "/"
-        local segments = {}
-        for part in path:gmatch("[^/]+") do
-            if part == ".." then
-                table.remove(segments)
-            elseif part ~= "." and part ~= "" then
-                table.insert(segments, part)
-            end
-        end
-        local result = table.concat(segments, "/")
-        if leading_slash and result ~= "" then
-            result = "/" .. result
-        elseif leading_slash then
-            result = "/"
-        end
-        return result
-    end
-
-    local function getHomeDir()
-        return normalizeVirtualPath(
-            (G_reader_settings and G_reader_settings:readSetting("home_dir"))
-            or filemanagerutil.getDefaultDir()
-        )
-    end
+    local appendPath = appendVirtualPath
+    local normalizeVirtualPath = normalizeVirtualPathString
+    local getHomeDir = getCollectionsHomeDir
 
     local function isHomePath(path)
         if not path then
@@ -1081,6 +1091,7 @@ local function installCollectionsViewPlugin()
     local saved_filemanager_mode = nil
     local currently_in_collections = false
     local active_virtual_display_mode = nil
+    local active_scan_on_show_path = nil
     local last_virtual_path = nil
     local restoreFileManagerDisplayMode
 
@@ -1156,6 +1167,39 @@ local function installCollectionsViewPlugin()
         return item_table
     end
 
+    local function resetScanOnShowState()
+        active_scan_on_show_path = nil
+    end
+
+    local function maybeScanCollectionOnShow(path, collection_name)
+        local effective_path = normalizeVirtualPath(path)
+        if not effective_path or not collection_name then
+            resetScanOnShowState()
+            return
+        end
+        if active_scan_on_show_path == effective_path then
+            return
+        end
+
+        active_scan_on_show_path = effective_path
+
+        local coll_settings = ReadCollection.coll_settings[collection_name]
+        local folders = coll_settings and coll_settings.folders
+        if not folders then
+            return
+        end
+
+        for _, folder_settings in pairs(folders) do
+            if folder_settings.scan_on_show then
+                -- Only rescan when entering a collection view, not on every redraw/refresh.
+                logger.dbg("CollectionsView plugin: scan_on_show triggered for", collection_name)
+                ReadCollection:updateCollectionFromFolder(collection_name)
+                ReadCollection:write()
+                break
+            end
+        end
+    end
+
     local function buildVirtualItemTable(self, path)
         local effective_path = normalizeVirtualPath(path or self._cb_virtual_path)
         if not effective_path or self.name ~= "filemanager" or not containsCollectionsSegment(effective_path) then
@@ -1165,6 +1209,7 @@ local function installCollectionsViewPlugin()
         patchCoverBrowserVirtualRenderers()
 
         if isCollectionsRoot(effective_path) then
+            resetScanOnShowState()
             local dirs = buildCollectionDirItems(self, effective_path)
             logger.dbg("CollectionsView plugin: building collections root", effective_path, #dirs)
             if #dirs == 0 then
@@ -1182,25 +1227,13 @@ local function installCollectionsViewPlugin()
 
         local collection_name = getCollectionFromPath(effective_path)
         if collection_name then
-            -- Scan any connected folders that have scan_on_show enabled before building the list
-            local coll_settings = collection_name and ReadCollection.coll_settings[collection_name] or nil
-            local folders = coll_settings and coll_settings.folders
-            if folders then
-                for _, folder_settings in pairs(folders) do
-                    if folder_settings.scan_on_show then
-                        -- updateCollectionFromFolder rescans all connected folders for this collection at once
-                        logger.dbg("CollectionsView plugin: scan_on_show triggered for", collection_name)
-                        ReadCollection:updateCollectionFromFolder(collection_name)
-                        ReadCollection:write()
-                        break
-                    end
-                end
-            end
+            maybeScanCollectionOnShow(effective_path, collection_name)
             local files = buildCollectionFileItems(self, effective_path, collection_name)
             logger.dbg("CollectionsView plugin: building collection", collection_name, #files)
             return composeVirtualItemTable({}, files, effective_path)
         end
 
+        resetScanOnShowState()
         return {}
     end
 
@@ -1290,6 +1323,16 @@ local function installCollectionsViewPlugin()
             return
         end
 
+        if not self._cb_virtual_dirty
+            and self.item_table
+            and self.path == self._cb_virtual_path
+            and not self.focused_path
+        then
+            logger.dbg("CollectionsView plugin: reuse virtual item table", self._cb_virtual_path, #self.item_table)
+            self:updateItems(1, false)
+            return
+        end
+
         local itemmatch
         if self.focused_path then
             itemmatch = { path = self.focused_path }
@@ -1306,6 +1349,7 @@ local function installCollectionsViewPlugin()
         self.path = self._cb_virtual_path
         self.item_table = item_table
         self.path_items = self.path_items or {}
+        self._cb_virtual_dirty = nil
 
         local itemnumber = self.path_items[self._cb_virtual_path]
         if type(itemmatch) == "table" then
@@ -1433,6 +1477,7 @@ local function installCollectionsViewPlugin()
         if not fc then
             return
         end
+        fc._cb_virtual_dirty = true
         if target_path and fc.changeToPath then
             fc:changeToPath(target_path)
         elseif fc.refreshPath then
@@ -1444,6 +1489,24 @@ local function installCollectionsViewPlugin()
         ReadCollection:write()
         markCollectionsUpdated(changed_names)
         refreshVirtualCollectionsView(fc, target_path)
+    end
+
+    local function removeItemsFromVirtualCollection(fc, collection_name, files, target_path)
+        if not collection_name or not files then
+            return
+        end
+
+        local removed_any = false
+        for _, file in ipairs(files) do
+            if file then
+                ReadCollection:removeItem(file, collection_name, true)
+                removed_any = true
+            end
+        end
+
+        if removed_any then
+            commitVirtualCollectionChanges(fc, { collection_name }, target_path)
+        end
     end
 
     local function getCollectionSettings(collection_name)
@@ -1902,7 +1965,12 @@ local function installCollectionsViewPlugin()
     local function openVirtualPath(self, path, focused_path)
         logger.dbg("CollectionsView plugin: openVirtualPath", path)
         patchCoverBrowserVirtualRenderers()
-        self._cb_virtual_path = normalizeVirtualPath(path)
+        local normalized_path = normalizeVirtualPath(path)
+        self._cb_virtual_dirty = self._cb_virtual_dirty
+            or self._cb_virtual_path ~= normalized_path
+            or focused_path ~= nil
+            or not self.item_table
+        self._cb_virtual_path = normalized_path
         syncCollectionsDisplayMode(self._cb_virtual_path)
         last_virtual_path = self._cb_virtual_path
         self._cb_ignore_folder_up_once = true
@@ -1955,7 +2023,9 @@ local function installCollectionsViewPlugin()
         if self.name == "filemanager" and self._cb_virtual_path then
             self._cb_virtual_path = nil
             self._cb_ignore_folder_up_once = nil
+            self._cb_virtual_dirty = nil
             last_virtual_path = nil
+            resetScanOnShowState()
             restoreFileManagerDisplayMode()
             syncVirtualTitleBar(self)
         end
@@ -1973,7 +2043,9 @@ local function installCollectionsViewPlugin()
                 else
                     self._cb_virtual_path = nil
                     self._cb_ignore_folder_up_once = nil
+                    self._cb_virtual_dirty = nil
                     last_virtual_path = nil
+                    resetScanOnShowState()
                     restoreFileManagerDisplayMode()
                     orig_changeToPath(self, getHomeDir(), self.path)
                 end
@@ -1998,7 +2070,9 @@ local function installCollectionsViewPlugin()
             else
                 self._cb_virtual_path = nil
                 self._cb_ignore_folder_up_once = nil
+                self._cb_virtual_dirty = nil
                 last_virtual_path = nil
+                resetScanOnShowState()
                 restoreFileManagerDisplayMode()
                 syncVirtualTitleBar(self)
                 orig_changeToPath(self, getHomeDir(), self.path)
@@ -2019,7 +2093,9 @@ local function installCollectionsViewPlugin()
                 openVirtualPath(self, parent_path)
             else
                 self._cb_virtual_path = nil
+                self._cb_virtual_dirty = nil
                 last_virtual_path = nil
+                resetScanOnShowState()
                 restoreFileManagerDisplayMode()
                 syncVirtualTitleBar(self)
                 orig_changeToPath(self, getHomeDir(), self.path)
@@ -2036,6 +2112,7 @@ local function installCollectionsViewPlugin()
             local virtual_path = fc._cb_virtual_path or last_virtual_path
             if virtual_path and containsCollectionsSegment(virtual_path) then
                 fc._cb_virtual_path = normalizeVirtualPath(virtual_path)
+                fc._cb_virtual_dirty = true
                 last_virtual_path = fc._cb_virtual_path
                 Screen:setWindowTitle(getWindowTitle(fc._cb_virtual_path))
                 renderVirtualItemTable(fc)
@@ -2137,11 +2214,11 @@ local function installCollectionsViewPlugin()
                         ok_text = _("Remove"),
                         ok_callback = function()
                             UIManager:close(self.plus_dialog)
-                            local selected_files = self.selected_files
-                            for file in pairs(selected_files) do
-                                ReadCollection:removeItem(file, collection_name, true)
+                            local selected_files = {}
+                            for file in pairs(self.selected_files) do
+                                selected_files[#selected_files + 1] = file
                             end
-                            ReadCollection:write({ [collection_name] = true })
+                            removeItemsFromVirtualCollection(fc, collection_name, selected_files, fc and fc._cb_virtual_path)
                             self:onToggleSelectMode(true)
                         end,
                     })
@@ -2179,9 +2256,13 @@ local function installCollectionsViewPlugin()
                             UIManager:close(current_fc.file_dialog)
                         end
                         if current_collection then
-                            ReadCollection:removeItem(file, current_collection)
-                        end
-                        if current_fc then
+                            removeItemsFromVirtualCollection(
+                                current_fc,
+                                current_collection,
+                                { file },
+                                current_fc and current_fc._cb_virtual_path
+                            )
+                        elseif current_fc then
                             current_fc:refreshPath()
                         end
                     end,
@@ -2203,9 +2284,38 @@ function CollectionsView:init()
     if hooks and hooks.addVirtualCollectionFileDialogButtons then
         hooks.addVirtualCollectionFileDialogButtons(self.ui)
     end
+    self:onDispatcherRegisterActions()
     if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
         self.ui.menu:registerToMainMenu(self)
     end
+end
+
+function CollectionsView:onDispatcherRegisterActions()
+    if dispatcher_actions_registered then
+        return
+    end
+
+    local Dispatcher = require("dispatcher")
+    Dispatcher:registerAction("collectionsview_open_root", {
+        category = "none",
+        event = "OpenCollectionsRoot",
+        title = _("Collections View: Open Collections"),
+        filemanager = true,
+    })
+    dispatcher_actions_registered = true
+end
+
+function CollectionsView:onOpenCollectionsRoot()
+    local FileManager = require("apps/filemanager/filemanager")
+    local fm = FileManager and FileManager.instance
+    local fc = fm and fm.file_chooser
+    if not fc then
+        return true
+    end
+
+    fc._cb_virtual_dirty = true
+    fc:changeToPath(getCollectionsVirtualRootPath())
+    return true
 end
 
 function CollectionsView:_refreshCollectionsView()
@@ -2215,6 +2325,7 @@ function CollectionsView:_refreshCollectionsView()
     if not fc then
         return
     end
+    fc._cb_virtual_dirty = true
     fc:refreshPath()
 end
 
